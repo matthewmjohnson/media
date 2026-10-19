@@ -1665,6 +1665,177 @@ public class FrameAggregatorTest {
   }
 
   @Test
+  public void queueEndOfStream_withMixedRatesAndCommonTrim_keepsAllFourFinalFrames() {
+    FrameAggregator frameAggregator =
+        new FrameAggregator(
+            /* numSequences= */ 4,
+            /* frameRate= */ new Rational(30, 1),
+            /* downstreamConsumer= */ this::recordOutputFrames,
+            /* onFlush= */ flushedSequences::add);
+    long[] finalFrameTimesUs = {9_700_000, 9_666_667, 9_666_667, 9_700_000};
+    for (int i = 0; i < 4; i++) {
+      frameAggregator.registerSequence(
+          i, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, /* sequenceEndTimeUs= */ 9_705_000);
+    }
+    for (int i = 0; i < 4; i++) {
+      frameAggregator.queueFrame(
+          createFrame(finalFrameTimesUs[i], finalFrameTimesUs[i], /* sequenceIndex= */ i),
+          /* sequenceIndex= */ i);
+    }
+    assertThat(outputFrames).hasSize(1);
+
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 1);
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 2);
+
+    assertThat(outputFrames).hasSize(2);
+    assertOutputPacket(
+        outputFrames.get(1),
+        /* expectedSize= */ 4,
+        /* expectedPresentationTimeUs= */ 9_700_000,
+        /* expectedSequencePresentationTimeUs= */ 9_700_000,
+        new SourceFrame(0, 9_700_000, 9_700_000),
+        new SourceFrame(1, 9_666_667, 9_666_667),
+        new SourceFrame(2, 9_666_667, 9_666_667),
+        new SourceFrame(3, 9_700_000, 9_700_000));
+    for (List<AsyncFrame> packet : outputFrames) {
+      packet.forEach(frame -> TransformerUtil.releaseIfNeeded(frame.frame, null));
+    }
+
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 0);
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 3);
+
+    assertThat(outputFrames).hasSize(3);
+    assertThat(outputFrames.get(2)).containsExactly(END_OF_STREAM_ASYNC_FRAME);
+    assertThat(releasedFrameTimestamps)
+        .containsExactly(9_700_000L, 9_666_667L, 9_666_667L, 9_700_000L);
+    frameAggregator.close();
+  }
+
+  @Test
+  public void queueEndOfStream_withKnownEnds_holdsSparseFinalFramesUntilSequenceEnd() {
+    FrameAggregator frameAggregator =
+        new FrameAggregator(
+            /* numSequences= */ 3,
+            /* frameRate= */ new Rational(30, 1),
+            /* downstreamConsumer= */ this::recordOutputFrames,
+            /* onFlush= */ flushedSequences::add);
+    for (int i = 0; i < 3; i++) {
+      frameAggregator.registerSequence(
+          i, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, /* sequenceEndTimeUs= */ 6_816_666);
+    }
+    frameAggregator.queueFrame(
+        createFrame(6_770_578, 6_770_578, /* sequenceIndex= */ 0), /* sequenceIndex= */ 0);
+    frameAggregator.queueFrame(
+        createFrame(6_742_844, 6_742_844, /* sequenceIndex= */ 1), /* sequenceIndex= */ 1);
+    frameAggregator.queueFrame(
+        createFrame(6_762_622, 6_762_622, /* sequenceIndex= */ 2), /* sequenceIndex= */ 2);
+    assertThat(outputFrames).isEmpty();
+
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 1);
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 2);
+
+    assertThat(outputFrames).hasSize(1);
+    assertOutputPacket(
+        outputFrames.get(0),
+        /* expectedSize= */ 3,
+        /* expectedPresentationTimeUs= */ 6_766_667,
+        /* expectedSequencePresentationTimeUs= */ 6_766_667,
+        new SourceFrame(0, 6_770_578, 6_770_578),
+        new SourceFrame(1, 6_742_844, 6_742_844),
+        new SourceFrame(2, 6_762_622, 6_762_622));
+
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 0);
+
+    assertThat(outputFrames).hasSize(3);
+    assertOutputPacket(
+        outputFrames.get(1),
+        /* expectedSize= */ 3,
+        /* expectedPresentationTimeUs= */ 6_800_000,
+        /* expectedSequencePresentationTimeUs= */ 6_800_000,
+        new SourceFrame(0, 6_770_578, 6_770_578),
+        new SourceFrame(1, 6_742_844, 6_742_844),
+        new SourceFrame(2, 6_762_622, 6_762_622));
+    assertThat(outputFrames.get(2)).containsExactly(END_OF_STREAM_ASYNC_FRAME);
+    frameAggregator.close();
+  }
+
+  @Test
+  public void queueEndOfStream_withKnownEnds_omitsShorterSequenceAtItsExactEnd() {
+    FrameAggregator frameAggregator =
+        new FrameAggregator(
+            /* numSequences= */ 2,
+            /* frameRate= */ new Rational(30, 1),
+            /* downstreamConsumer= */ this::recordOutputFrames,
+            /* onFlush= */ flushedSequences::add);
+    frameAggregator.registerSequence(
+        0, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, /* sequenceEndTimeUs= */ 133_333);
+    frameAggregator.registerSequence(
+        1, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, /* sequenceEndTimeUs= */ 100_000);
+    frameAggregator.queueFrame(
+        createFrame(66_667, 66_667, /* sequenceIndex= */ 0), /* sequenceIndex= */ 0);
+    frameAggregator.queueFrame(
+        createFrame(66_667, 66_667, /* sequenceIndex= */ 1), /* sequenceIndex= */ 1);
+    frameAggregator.queueFrame(
+        createFrame(100_000, 100_000, /* sequenceIndex= */ 0), /* sequenceIndex= */ 0);
+
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 1);
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 0);
+
+    assertThat(outputFrames).hasSize(3);
+    assertOutputPacket(
+        outputFrames.get(0),
+        /* expectedSize= */ 2,
+        /* expectedPresentationTimeUs= */ 66_667,
+        /* expectedSequencePresentationTimeUs= */ 66_667);
+    assertOutputPacket(
+        outputFrames.get(1),
+        /* expectedSize= */ 1,
+        /* expectedPresentationTimeUs= */ 100_000,
+        /* expectedSequencePresentationTimeUs= */ 100_000,
+        new SourceFrame(0, 100_000, 100_000));
+    assertThat(outputFrames.get(2)).containsExactly(END_OF_STREAM_ASYNC_FRAME);
+    frameAggregator.close();
+  }
+
+  @Test
+  public void flush_withKnownEnd_releasesRetainedFrameAndRestartsVirtualClock() {
+    FrameAggregator frameAggregator =
+        new FrameAggregator(
+            /* numSequences= */ 1,
+            /* frameRate= */ new Rational(30, 1),
+            /* downstreamConsumer= */ this::recordOutputFrames,
+            /* onFlush= */ flushedSequences::add);
+    frameAggregator.registerSequence(
+        0, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, /* sequenceEndTimeUs= */ 100_000);
+    frameAggregator.queueFrame(
+        createFrame(66_667, 66_667, /* sequenceIndex= */ 0), /* sequenceIndex= */ 0);
+    TransformerUtil.releaseIfNeeded(outputFrames.get(0).get(0).frame, /* releaseFence= */ null);
+    assertThat(releasedFrameTimestamps).isEmpty();
+
+    frameAggregator.flush(/* sequenceIndex= */ 0);
+
+    assertThat(releasedFrameTimestamps).containsExactly(66_667L);
+    frameAggregator.queueFrame(
+        createFrame(0, 0, /* sequenceIndex= */ 0), /* sequenceIndex= */ 0);
+    frameAggregator.queueEndOfStream(/* sequenceIndex= */ 0);
+    assertThat(outputFrames).hasSize(5);
+    assertOutputPacket(
+        outputFrames.get(1),
+        /* expectedSize= */ 1,
+        /* expectedPresentationTimeUs= */ 0,
+        /* expectedSequencePresentationTimeUs= */ 0,
+        new SourceFrame(0, 0, 0));
+    assertOutputPacket(
+        outputFrames.get(3),
+        /* expectedSize= */ 1,
+        /* expectedPresentationTimeUs= */ 66_667,
+        /* expectedSequencePresentationTimeUs= */ 66_667,
+        new SourceFrame(0, 0, 0));
+    assertThat(outputFrames.get(4)).containsExactly(END_OF_STREAM_ASYNC_FRAME);
+    frameAggregator.close();
+  }
+
+  @Test
   public void queueFrame_withFrameRateAndSecondarySequenceEndsEarly_outputsOnlyPrimaryFrame() {
     FrameAggregator frameAggregator =
         new FrameAggregator(

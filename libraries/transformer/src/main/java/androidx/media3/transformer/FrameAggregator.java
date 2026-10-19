@@ -145,10 +145,22 @@ import java.util.function.Consumer;
    *     to the number of sequences.
    */
   public void registerSequence(int sequenceIndex, @AggregationStrategy int aggregationStrategy) {
+    registerSequence(sequenceIndex, aggregationStrategy, /* sequenceEndTimeUs= */ C.TIME_UNSET);
+  }
+
+  /**
+   * Registers a sequence with an exclusive presentation end time.
+   *
+   * <p>A known end time allows the final frame to cover the remainder of the sequence after decoder
+   * EOS. Use {@link C#TIME_UNSET} to preserve timestamp-only matching.
+   */
+  public void registerSequence(
+      int sequenceIndex, @AggregationStrategy int aggregationStrategy, long sequenceEndTimeUs) {
     checkArgument(sequenceIndex >= 0);
     checkArgument(sequenceIndex < numSequences);
+    checkArgument(sequenceEndTimeUs == C.TIME_UNSET || sequenceEndTimeUs >= 0);
     checkState(!isClosed);
-    inputFrameQueues.get(sequenceIndex).initialize(aggregationStrategy);
+    inputFrameQueues.get(sequenceIndex).initialize(aggregationStrategy, sequenceEndTimeUs);
   }
 
   /**
@@ -481,6 +493,7 @@ import java.util.function.Consumer;
     private boolean isRegistered;
     private @AggregationStrategy int aggregationStrategy;
     private boolean isEnded;
+    private long sequenceEndTimeUs;
 
     FrameQueue() {
       frames = new ArrayDeque<>();
@@ -488,10 +501,11 @@ import java.util.function.Consumer;
       aggregationStrategy = STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET;
     }
 
-    void initialize(@AggregationStrategy int aggregationStrategy) {
+    void initialize(@AggregationStrategy int aggregationStrategy, long sequenceEndTimeUs) {
       checkState(!isRegistered);
       this.isRegistered = true;
       this.aggregationStrategy = aggregationStrategy;
+      this.sequenceEndTimeUs = sequenceEndTimeUs;
     }
 
     void setIsEnded(boolean isEnded) {
@@ -528,7 +542,8 @@ import java.util.function.Consumer;
      *
      * <ul>
      *   <li>If the queue is empty, returns {@code null}.
-     *   <li>If all frames in the queue are older than {@code targetFrame}, returns {@code null}:
+     *   <li>If all frames in the queue are older than {@code targetFrame}, returns {@code null},
+     *       unless EOS has been reached and a known sequence end time still covers the target:
      *       <ul>
      *         <li>When {@code aggregationStrategy} is {@link
      *             #STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET}, all queued frames are released
@@ -557,6 +572,15 @@ import java.util.function.Consumer;
         return frames.peek();
       }
 
+      if (isEnded && sequenceEndTimeUs != C.TIME_UNSET && targetTimeUs >= sequenceEndTimeUs) {
+        // Drain retained frames at the authored end so the virtual clock can reach EOS.
+        @Nullable AsyncFrame expiredFrame;
+        while ((expiredFrame = frames.poll()) != null) {
+          TransformerUtil.releaseIfNeeded(expiredFrame.frame, /* releaseFence= */ null);
+        }
+        return null;
+      }
+
       discardPrecedingFramesExceptMostRecent(targetTimeUs);
 
       AsyncFrame firstFrame = checkNotNull(frames.peek());
@@ -577,7 +601,9 @@ import java.util.function.Consumer;
         return previousFrame;
       }
 
-      return null;
+      return isEnded && sequenceEndTimeUs != C.TIME_UNSET && targetTimeUs < sequenceEndTimeUs
+          ? firstFrame
+          : null;
     }
 
     /**
