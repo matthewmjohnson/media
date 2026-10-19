@@ -121,6 +121,7 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   private var outputFile: File? = null
   private var preparedComposition: Composition? = null
   private var playerPrepared: Boolean = false
+  private var tailReproductionEnabled: Boolean = false
   private val fpsLock = Any()
   @GuardedBy("fpsLock")
   private val frameRateCalculator = FrameRateCalculator(windowDurationMs = FPS_TRACKING_DURATION_MS)
@@ -199,6 +200,7 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
           )
       )
     }
+    onPresetSelected(Preset.GRID)
   }
 
   override fun onCleared() {
@@ -211,7 +213,38 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
     _uiState.update { currentState -> currentState.copy(snackbarMessage = null) }
   }
 
+  private fun createTimecodeGridItems(overlayFps: Int): List<List<Item>> {
+    require(overlayFps == 24 || overlayFps == 30)
+    val clipping =
+      MediaItem.ClippingConfiguration.Builder()
+        .setStartPositionUs(0L)
+        .setEndPositionUs(9_705_000L)
+        .build()
+    val primary =
+      Media(
+        durationUs = 10_000_000L,
+        title = "30fps main/control",
+        uri = "file:///sdcard/Movies/timecode-10s-30fps.mp4",
+        clippingConfiguration = clipping,
+      )
+    val overlay =
+      Media(
+        durationUs = 10_000_000L,
+        title = "${overlayFps}fps overlay",
+        uri = "file:///sdcard/Movies/timecode-10s-${overlayFps}fps.mp4",
+        clippingConfiguration = clipping,
+      )
+    Log.i(
+      TAG,
+      "TailRepro: grid inputs 30/$overlayFps/$overlayFps/30fps; all source 0-9705000us; output 30fps",
+    )
+    return listOf(listOf(primary), listOf(overlay), listOf(overlay), listOf(primary))
+  }
+
   fun onPresetSelected(preset: Preset) {
+    tailReproductionEnabled = preset == Preset.GRID
+    val gridItems =
+      if (preset == Preset.GRID) createTimecodeGridItems(overlayFps = 24) else emptyList()
     _uiState.update { currentState ->
       val numSequences =
         when (preset) {
@@ -222,15 +255,14 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       val currentTrackTypes = currentState.sequenceTrackTypes
       val newTrackTypes =
         List(numSequences) { i ->
-          if (i < currentTrackTypes.size) currentTrackTypes[i]
+          if (preset == Preset.GRID) setOf(C.TRACK_TYPE_VIDEO)
+          else if (i < currentTrackTypes.size) currentTrackTypes[i]
           else setOf(C.TRACK_TYPE_AUDIO, C.TRACK_TYPE_VIDEO)
         }
       val firstItem = currentState.mediaState.availableItems.firstOrNull()?.copy()
       val newItemsBySequence: List<List<Item>> =
         when (preset) {
-          Preset.GRID -> {
-            List(4) { if (firstItem != null) listOf(firstItem.copy()) else emptyList() }
-          }
+          Preset.GRID -> gridItems
           Preset.PIP -> {
             List(2) {
               if (firstItem != null) listOf(firstItem.copy(), firstItem.copy()) else emptyList()
@@ -247,6 +279,15 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       currentState.copy(
         sequenceTrackTypes = newTrackTypes,
         mediaState = currentState.mediaState.copy(selectedItemsBySequence = newItemsBySequence),
+        outputSettingsState =
+          if (preset == Preset.GRID) {
+            currentState.outputSettingsState.copy(
+              frameProcessorEnabled = true,
+              frameAggregationFps = "30",
+            )
+          } else {
+            currentState.outputSettingsState
+          },
         isCompositionSet = false,
         selectedPreset = preset,
         selectedSequenceIndex = 0,
@@ -849,6 +890,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
               MediaItem.Builder()
                 .setUri(item.uri)
                 .setImageDurationMs(usToMs(item.durationUs)) // Ignored for audio/video
+                .apply {
+                  item.clippingConfiguration?.let { clipping -> setClippingConfiguration(clipping) }
+                }
                 .build()
             val effectsForItem = mutableListOf<Effect>()
             for (effectName in item.selectedEffects) {
@@ -1039,6 +1083,15 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
     val player = playerBuilder.build()
     player.addListener(
       object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+          if (tailReproductionEnabled) {
+            Log.i(
+              TAG,
+              "TailRepro: state=$playbackState positionMs=${player.currentPosition}",
+            )
+          }
+        }
+
         override fun onPlayerError(error: PlaybackException) {
           _uiState.update { currentState ->
             currentState.copy(
@@ -1071,6 +1124,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       }
     )
     player.setVideoFrameMetadataListener { presentationTimeUs, releaseTimeNs, format, mediaFormat ->
+      if (tailReproductionEnabled && presentationTimeUs >= 9_500_000L) {
+        Log.i(TAG, "TailRepro: output presentationTimeUs=$presentationTimeUs")
+      }
       val fps = synchronized(fpsLock) { frameRateCalculator.registerFrameAndGetFps() }
       if (fps != null) {
         _uiState.update { it.copy(currentFps = fps) }

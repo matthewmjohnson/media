@@ -17,6 +17,7 @@ package androidx.media3.demo.composition.data
 
 import androidx.annotation.OptIn
 import androidx.compose.ui.geometry.Size
+import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 
 /**
@@ -89,6 +90,7 @@ data class Media(
   val uri: String,
   val selectedEffects: Set<String> = emptySet(),
   val speed: Float = 1.0f,
+  val clippingConfiguration: MediaItem.ClippingConfiguration? = null,
 ) : Item {
   override fun copy(): Item =
     copy(
@@ -97,6 +99,7 @@ data class Media(
       uri = uri,
       selectedEffects = selectedEffects,
       speed = speed,
+      clippingConfiguration = clippingConfiguration,
     )
 }
 
