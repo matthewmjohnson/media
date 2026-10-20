@@ -1624,8 +1624,8 @@ public final class CompositionPlayer extends SimpleBasePlayer {
   private SequencePlayerHolder createSequencePlayer(Composition composition, int sequenceIndex) {
     boolean requestMediaCodecToneMapping =
         composition.hdrMode == Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_MEDIACODEC;
-    boolean sequenceContainsVideo =
-        composition.sequences.get(sequenceIndex).trackTypes.contains(C.TRACK_TYPE_VIDEO);
+    EditedMediaItemSequence sequence = composition.sequences.get(sequenceIndex);
+    boolean sequenceContainsVideo = sequence.trackTypes.contains(C.TRACK_TYPE_VIDEO);
     SequenceRenderersFactory renderersFactory;
     Supplier<@Nullable HardwareBufferFrameReader> hardwareBufferFrameReaderSupplier = () -> null;
     if (frameProcessor != null) {
@@ -1679,7 +1679,16 @@ public final class CompositionPlayer extends SimpleBasePlayer {
       } else {
         aggregationStrategy = STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET;
       }
-      checkNotNull(currentFrameAggregator).registerSequence(sequenceIndex, aggregationStrategy);
+      ImmutableList.Builder<Long> itemEndTimesUs = ImmutableList.builder();
+      if (sequenceContainsVideo && !sequence.isLooping) {
+        long endTimeUs = 0;
+        for (EditedMediaItem item : sequence.editedMediaItems) {
+          endTimeUs += item.getPresentationDurationUs();
+          itemEndTimesUs.add(endTimeUs);
+        }
+      }
+      checkNotNull(currentFrameAggregator)
+          .registerSequence(sequenceIndex, aggregationStrategy, itemEndTimesUs.build());
     } else {
       VideoSink inputSink = checkNotNull(playbackVideoGraphWrapper).getSink(sequenceIndex);
       renderersFactory =

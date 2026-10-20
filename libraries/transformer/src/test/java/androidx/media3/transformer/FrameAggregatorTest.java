@@ -26,6 +26,7 @@ import static org.junit.Assert.assertThrows;
 import android.hardware.HardwareBuffer;
 import android.util.Rational;
 import androidx.annotation.Nullable;
+import androidx.media3.common.C;
 import androidx.media3.common.video.AsyncFrame;
 import androidx.media3.common.video.DefaultHardwareBufferFrame;
 import androidx.media3.common.video.Frame;
@@ -75,6 +76,169 @@ public class FrameAggregatorTest {
     if (placeholderBuffer != null) {
       placeholderBuffer.close();
     }
+  }
+
+  @Test
+  public void closestFrame_beforeItemBoundary_keepsCurrentItemUntilExclusiveEnd() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+    aggregator.queueFrame(createFrame(4_950_000, 4_950_000), 0);
+
+    assertThat(outputFrames).hasSize(2);
+    assertThat(getItemIndex(outputFrames.get(0).get(1))).isEqualTo(0);
+    assertThat(getItemIndex(outputFrames.get(1).get(1))).isEqualTo(1);
+  }
+
+  @Test
+  public void closestFrame_sameItem_stillChoosesCloserFollowingFrame() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(4_800_000, 4_800_000, 0), 1);
+
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+
+    assertThat(outputFrames.get(0).get(1).frame.getContentTimeUs()).isEqualTo(4_800_000);
+  }
+
+  @Test
+  public void closestFrame_sameItemTie_stillChoosesPrecedingFrame() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(4_800_000, 4_800_000, 0), 1);
+
+    aggregator.queueFrame(createFrame(4_400_000, 4_400_000), 0);
+
+    assertThat(outputFrames.get(0).get(1).frame.getContentTimeUs()).isEqualTo(4_000_000);
+  }
+
+  @Test
+  public void closestFrame_futureItemOnly_doesNotUseItOrBlockOtherSequences() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+
+    assertThat(outputFrames).hasSize(1);
+    assertThat(outputFrames.get(0)).hasSize(1);
+
+    aggregator.queueFrame(createFrame(4_950_000, 4_950_000), 0);
+    assertThat(getItemIndex(outputFrames.get(1).get(1))).isEqualTo(1);
+  }
+
+  @Test
+  public void closestFrame_atItemEnd_releasesExpiredBufferBeforeEos() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+
+    aggregator.queueFrame(createFrame(4_950_000, 4_950_000), 0);
+
+    assertThat(releasedFrameTimestamps).contains(4_000_000L);
+    assertThat(outputFrames).isEmpty();
+
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+    assertThat(getItemIndex(outputFrames.get(0).get(1))).isEqualTo(1);
+  }
+
+  @Test
+  public void closestFrame_afterSequenceEnd_releasesExpiredBufferWithoutWaitingForEos() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_950_000, 9_900_000, 1), 1);
+
+    aggregator.queueFrame(createFrame(10_000_000, 10_000_000), 0);
+
+    assertThat(releasedFrameTimestamps).contains(4_950_000L);
+    assertThat(outputFrames.get(0)).hasSize(1);
+  }
+
+  @Test
+  public void closestFrame_finalItemAtEos_doesNotAddTailRetention() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_950_000, 9_900_000, 1), 1);
+    aggregator.queueEndOfStream(1);
+
+    aggregator.queueFrame(createFrame(9_950_000, 9_950_000), 0);
+
+    assertThat(outputFrames.get(0)).hasSize(1);
+  }
+
+  @Test
+  public void closestFrame_afterFlush_doesNotReusePriorItemCandidate() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+    for (AsyncFrame frame : outputFrames.get(0)) {
+      TransformerUtil.releaseIfNeeded(frame.frame, /* releaseFence= */ null);
+    }
+    outputFrames.clear();
+
+    aggregator.flush(0);
+    aggregator.flush(1);
+
+    assertThat(releasedFrameTimestamps).contains(4_000_000L);
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+    assertThat(outputFrames.get(0)).hasSize(1);
+  }
+
+  @Test
+  public void atOrAfterFrame_beforeItemBoundary_keepsCurrentItem() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+
+    assertThat(getItemIndex(outputFrames.get(0).get(1))).isEqualTo(0);
+  }
+
+  @Test
+  public void atOrAfterFrame_sameItem_preservesFollowingFramePreference() {
+    FrameAggregator aggregator = createBoundaryAggregator(STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET);
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(4_800_000, 4_800_000, 0), 1);
+
+    aggregator.queueFrame(createFrame(4_100_000, 4_100_000), 0);
+
+    assertThat(outputFrames.get(0).get(1).frame.getContentTimeUs()).isEqualTo(4_800_000);
+  }
+
+  @Test
+  public void virtualClock_beforeItemBoundary_retimesPictureWithoutChangingItsItem() {
+    FrameAggregator aggregator =
+        new FrameAggregator(2, new Rational(30, 1), outputFrames::add, flushedSequences::add);
+    aggregator.registerSequence(0, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+    aggregator.registerSequence(
+        1, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, ImmutableList.of(4_950_000L, 10_000_000L));
+    aggregator.queueFrame(createItemFrame(4_000_000, 4_000_000, 0), 1);
+    aggregator.queueFrame(createItemFrame(0, 4_950_000, 1), 1);
+
+    aggregator.queueFrame(createFrame(4_600_000, 4_600_000), 0);
+
+    List<AsyncFrame> packet = Iterables.getLast(outputFrames);
+    assertThat(packet.get(0).frame.getContentTimeUs()).isEqualTo(4_600_000);
+    assertThat(packet.get(1).frame.getContentTimeUs()).isEqualTo(4_600_000);
+    assertThat(getItemIndex(packet.get(1))).isEqualTo(0);
+  }
+
+  @Test
+  public void registerSequence_invalidItemEnds_throwsIllegalArgumentException() {
+    FrameAggregator aggregator =
+        new FrameAggregator(2, null, outputFrames::add, flushedSequences::add);
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            aggregator.registerSequence(
+                1, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, ImmutableList.of(-1L)));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            aggregator.registerSequence(
+                1, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET, ImmutableList.of(20L, 10L)));
   }
 
   @Test
@@ -2336,20 +2500,29 @@ public class FrameAggregatorTest {
 
   private AsyncFrame createFrame(
       long presentationTimeUs, long sequencePresentationTimeUs, int sequenceIndex) {
+    return createFrame(
+        presentationTimeUs, sequencePresentationTimeUs, sequenceIndex, C.INDEX_UNSET);
+  }
+
+  private AsyncFrame createFrame(
+      long presentationTimeUs, long sequencePresentationTimeUs, int sequenceIndex, int itemIndex) {
+    ImmutableMap.Builder<String, Object> metadata =
+        ImmutableMap.<String, Object>builder()
+            .put(Frame.KEY_PRESENTATION_TIME_US, presentationTimeUs)
+            .put(Frame.KEY_DISPLAY_TIME_NS, sequencePresentationTimeUs * 1_000L)
+            .put(
+                "SOURCE_FRAME_METADATA",
+                new SourceFrame(sequenceIndex, presentationTimeUs, sequencePresentationTimeUs));
+    if (itemIndex != C.INDEX_UNSET) {
+      metadata.put(Composition.KEY_COMPOSITION_ITEM_INDEX, itemIndex);
+    }
     DefaultHardwareBufferFrame frame =
         new DefaultHardwareBufferFrame.Builder(
                 placeholderBuffer,
                 directExecutor(),
                 (releaseFence) -> releasedFrameTimestamps.add(presentationTimeUs))
             .setContentTimeUs(sequencePresentationTimeUs)
-            .setMetadata(
-                ImmutableMap.of(
-                    Frame.KEY_PRESENTATION_TIME_US,
-                    presentationTimeUs,
-                    Frame.KEY_DISPLAY_TIME_NS,
-                    sequencePresentationTimeUs * 1_000L,
-                    "SOURCE_FRAME_METADATA",
-                    new SourceFrame(sequenceIndex, presentationTimeUs, sequencePresentationTimeUs)))
+            .setMetadata(metadata.buildOrThrow())
             .setInternalImage(this)
             .build();
     return new AsyncFrame(frame, /* acquireFence= */ null);
@@ -2384,6 +2557,22 @@ public class FrameAggregatorTest {
 
   private static void registerAllSequences(FrameAggregator frameAggregator, int numSequences) {
     registerAllSequences(frameAggregator, numSequences, STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET);
+  }
+
+  private FrameAggregator createBoundaryAggregator(@AggregationStrategy int strategy) {
+    FrameAggregator aggregator =
+        new FrameAggregator(2, null, outputFrames::add, flushedSequences::add);
+    aggregator.registerSequence(0, strategy);
+    aggregator.registerSequence(1, strategy, ImmutableList.of(4_950_000L, 10_000_000L));
+    return aggregator;
+  }
+
+  private AsyncFrame createItemFrame(long presentationTimeUs, long sequenceTimeUs, int itemIndex) {
+    return createFrame(presentationTimeUs, sequenceTimeUs, /* sequenceIndex= */ 1, itemIndex);
+  }
+
+  private static int getItemIndex(AsyncFrame frame) {
+    return (Integer) frame.frame.getMetadata().get(Composition.KEY_COMPOSITION_ITEM_INDEX);
   }
 
   private static void registerAllSequences(

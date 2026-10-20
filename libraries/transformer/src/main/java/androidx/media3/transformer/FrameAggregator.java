@@ -145,10 +145,27 @@ import java.util.function.Consumer;
    *     to the number of sequences.
    */
   public void registerSequence(int sequenceIndex, @AggregationStrategy int aggregationStrategy) {
+    registerSequence(sequenceIndex, aggregationStrategy, ImmutableList.of());
+  }
+
+  /**
+   * Registers exclusive item end times in sequence time. Frames with composition item metadata are
+   * only matched inside their item's presentation window. An empty list preserves timestamp-only
+   * matching.
+   */
+  public void registerSequence(
+      int sequenceIndex,
+      @AggregationStrategy int aggregationStrategy,
+      ImmutableList<Long> itemEndTimesUs) {
     checkArgument(sequenceIndex >= 0);
     checkArgument(sequenceIndex < numSequences);
+    long previousEndTimeUs = 0;
+    for (long endTimeUs : itemEndTimesUs) {
+      checkArgument(endTimeUs >= previousEndTimeUs);
+      previousEndTimeUs = endTimeUs;
+    }
     checkState(!isClosed);
-    inputFrameQueues.get(sequenceIndex).initialize(aggregationStrategy);
+    inputFrameQueues.get(sequenceIndex).initialize(aggregationStrategy, itemEndTimesUs);
   }
 
   /**
@@ -441,12 +458,12 @@ import java.util.function.Consumer;
       FrameQueue secondaryQueue = inputFrameQueues.get(i);
       @Nullable AsyncFrame matchingFrame = secondaryQueue.getMatchingFrame(referenceFrame);
       if (matchingFrame == null) {
-        if (!secondaryQueue.getIsEnded()) {
+        if (!secondaryQueue.getIsEnded()
+            && !secondaryQueue.hasNoFrameForTarget(referenceFrame.frame.getContentTimeUs())) {
           // Need to wait for more frames in this secondary queue.
           return null;
         }
-        // Secondary queue ended before this primary frame no match is possible, so this sequence is
-        // ignored in the matching frames list.
+        // The queue has ended or cannot provide a frame whose item covers this target.
       } else {
         matchesBuilder.add(matchingFrame);
       }
@@ -481,17 +498,21 @@ import java.util.function.Consumer;
     private boolean isRegistered;
     private @AggregationStrategy int aggregationStrategy;
     private boolean isEnded;
+    private ImmutableList<Long> itemEndTimesUs;
 
     FrameQueue() {
       frames = new ArrayDeque<>();
       // Force FrameAggregator to wait for frames for this sequence, until initialize is called.
       aggregationStrategy = STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET;
+      itemEndTimesUs = ImmutableList.of();
     }
 
-    void initialize(@AggregationStrategy int aggregationStrategy) {
+    void initialize(
+        @AggregationStrategy int aggregationStrategy, ImmutableList<Long> itemEndTimesUs) {
       checkState(!isRegistered);
       this.isRegistered = true;
       this.aggregationStrategy = aggregationStrategy;
+      this.itemEndTimesUs = itemEndTimesUs;
     }
 
     void setIsEnded(boolean isEnded) {
@@ -509,11 +530,11 @@ import java.util.function.Consumer;
      * <p>When {@code aggregationStrategy} is {@link #STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET},
      * retains the previous frame relative to {@code targetFrame} and selects the closer frame
      * between the previous and following frames, breaking ties in favor of the previous frame.
+     * Registered item bounds restrict candidates to the item covering the target time.
      *
      * <p>When {@code aggregationStrategy} is {@link #STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET}, this
-     * method iterates through the frame queue, releasing any frames with presentation timestamps
-     * strictly less than {@code targetFrame}'s sequence presentation timestamp. The first remaining
-     * frame (with timestamp greater than or equal to {@code targetFrame}) is considered the match.
+     * method prefers the first frame at or after the target within the current item. Without item
+     * bounds, frames before the target are released immediately.
      *
      * <p>Matched frames are not removed from the queue by this method, as they might be needed to
      * match subsequent primary frames (i.e., upsampling the secondary stream).
@@ -531,8 +552,8 @@ import java.util.function.Consumer;
      *   <li>If all frames in the queue are older than {@code targetFrame}, returns {@code null}:
      *       <ul>
      *         <li>When {@code aggregationStrategy} is {@link
-     *             #STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET}, all queued frames are released
-     *             immediately.
+     *             #STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET} without item bounds, all queued frames
+     *             are released immediately.
      *         <li>When {@code aggregationStrategy} is {@link
      *             #STRATEGY_MATCH_FRAME_CLOSEST_TO_TARGET}, all queued frames except the most
      *             recent one are released; the most recent frame remains queued to be compared
@@ -552,32 +573,84 @@ import java.util.function.Consumer;
         return null;
       }
 
-      if (aggregationStrategy == STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET) {
+      if (aggregationStrategy == STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET
+          && itemEndTimesUs.isEmpty()) {
         discardAllFramesBefore(targetTimeUs);
         return frames.peek();
       }
 
       discardPrecedingFramesExceptMostRecent(targetTimeUs);
 
-      AsyncFrame firstFrame = checkNotNull(frames.peek());
+      @Nullable AsyncFrame firstFrame = frames.peek();
+      // Expired buffers can otherwise prevent the reader from delivering the next item or EOS.
+      while (firstFrame != null
+          && !itemEndTimesUs.isEmpty()
+          && targetTimeUs >= itemEndTimesUs.get(getItemIndex(firstFrame))) {
+        frames.remove();
+        TransformerUtil.releaseIfNeeded(firstFrame.frame, /* releaseFence= */ null);
+        firstFrame = frames.peek();
+      }
+      if (firstFrame == null) {
+        return null;
+      }
       if (firstFrame.frame.getContentTimeUs() >= targetTimeUs) {
-        return firstFrame;
+        return isWithinItemPresentationWindow(firstFrame, targetTimeUs) ? firstFrame : null;
       }
 
       if (frames.size() >= 2) {
         AsyncFrame previousFrame = firstFrame;
         AsyncFrame nextFrame = Iterables.get(frames, 1);
+        boolean previousFrameCoversTarget =
+            isWithinItemPresentationWindow(previousFrame, targetTimeUs);
+        boolean nextFrameCoversTarget = isWithinItemPresentationWindow(nextFrame, targetTimeUs);
         long previousDiffUs = targetTimeUs - previousFrame.frame.getContentTimeUs();
         long nextDiffUs = nextFrame.frame.getContentTimeUs() - targetTimeUs;
-        if (nextDiffUs < previousDiffUs) {
+        if (nextFrameCoversTarget
+            && (!previousFrameCoversTarget
+                || aggregationStrategy == STRATEGY_MATCH_FRAME_AT_OR_AFTER_TARGET
+                || nextDiffUs < previousDiffUs)) {
           frames.poll();
           TransformerUtil.releaseIfNeeded(previousFrame.frame, /* releaseFence= */ null);
           return nextFrame;
         }
-        return previousFrame;
+        return previousFrameCoversTarget ? previousFrame : null;
       }
 
       return null;
+    }
+
+    private boolean isWithinItemPresentationWindow(AsyncFrame frame, long targetTimeUs) {
+      if (itemEndTimesUs.isEmpty()) {
+        return true;
+      }
+      int itemIndex = getItemIndex(frame);
+      long startTimeUs = itemIndex == 0 ? 0 : itemEndTimesUs.get(itemIndex - 1);
+      return targetTimeUs >= startTimeUs && targetTimeUs < itemEndTimesUs.get(itemIndex);
+    }
+
+    private boolean hasNoFrameForTarget(long targetTimeUs) {
+      if (itemEndTimesUs.isEmpty()) {
+        return false;
+      }
+      if (targetTimeUs >= Iterables.getLast(itemEndTimesUs)) {
+        return true;
+      }
+      @Nullable AsyncFrame frame = frames.peek();
+      if (frame == null) {
+        return false;
+      }
+      int itemIndex = getItemIndex(frame);
+      long startTimeUs = itemIndex == 0 ? 0 : itemEndTimesUs.get(itemIndex - 1);
+      return targetTimeUs < startTimeUs;
+    }
+
+    private int getItemIndex(AsyncFrame frame) {
+      Object value =
+          checkNotNull(frame.frame.getMetadata().get(Composition.KEY_COMPOSITION_ITEM_INDEX));
+      checkState(value instanceof Integer);
+      int itemIndex = (Integer) value;
+      checkState(itemIndex >= 0 && itemIndex < itemEndTimesUs.size());
+      return itemIndex;
     }
 
     /**
