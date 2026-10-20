@@ -46,6 +46,7 @@ import androidx.media3.common.util.Log
 import androidx.media3.common.util.Size
 import androidx.media3.common.util.Util
 import androidx.media3.common.util.Util.usToMs
+import androidx.media3.common.video.AsyncFrame
 import androidx.media3.common.video.FrameProcessor
 import androidx.media3.demo.composition.MatrixTransformationFactory.createDizzyCropEffect
 import androidx.media3.demo.composition.data.CompositionPreviewState
@@ -88,6 +89,8 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -121,6 +124,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   private var outputFile: File? = null
   private var preparedComposition: Composition? = null
   private var playerPrepared: Boolean = false
+  @Volatile private var eosSeekReproductionEnabled = false
+  private var eosSeekJob: Job? = null
+  @Volatile private var lastRenderedTimeUs = C.TIME_UNSET
   private val fpsLock = Any()
   @GuardedBy("fpsLock")
   private val frameRateCalculator = FrameRateCalculator(windowDurationMs = FPS_TRACKING_DURATION_MS)
@@ -199,6 +205,7 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
           )
       )
     }
+    onPresetSelected(Preset.GRID)
   }
 
   override fun onCleared() {
@@ -212,6 +219,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   }
 
   fun onPresetSelected(preset: Preset) {
+    eosSeekJob?.cancel()
+    compositionPlayer.setScrubbingModeEnabled(false)
+    eosSeekReproductionEnabled = preset == Preset.GRID
     _uiState.update { currentState ->
       val numSequences =
         when (preset) {
@@ -222,14 +232,23 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       val currentTrackTypes = currentState.sequenceTrackTypes
       val newTrackTypes =
         List(numSequences) { i ->
-          if (i < currentTrackTypes.size) currentTrackTypes[i]
+          if (preset == Preset.GRID) setOf(C.TRACK_TYPE_VIDEO)
+          else if (i < currentTrackTypes.size) currentTrackTypes[i]
           else setOf(C.TRACK_TYPE_AUDIO, C.TRACK_TYPE_VIDEO)
         }
       val firstItem = currentState.mediaState.availableItems.firstOrNull()?.copy()
       val newItemsBySequence: List<List<Item>> =
         when (preset) {
           Preset.GRID -> {
-            List(4) { if (firstItem != null) listOf(firstItem.copy()) else emptyList() }
+            val video =
+              Media(
+                durationUs = 10_000_000L,
+                title = "24fps clipped to 280ms",
+                uri = "file:///sdcard/Movies/timecode-10s-24fps.mp4",
+                clippingConfiguration =
+                  MediaItem.ClippingConfiguration.Builder().setEndPositionUs(280_000L).build(),
+              )
+            List(4) { listOf(video) }
           }
           Preset.PIP -> {
             List(2) {
@@ -247,6 +266,15 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       currentState.copy(
         sequenceTrackTypes = newTrackTypes,
         mediaState = currentState.mediaState.copy(selectedItemsBySequence = newItemsBySequence),
+        outputSettingsState =
+          if (preset == Preset.GRID) {
+            currentState.outputSettingsState.copy(
+              frameProcessorEnabled = true,
+              frameAggregationFps = "24",
+            )
+          } else {
+            currentState.outputSettingsState
+          },
         isCompositionSet = false,
         selectedPreset = preset,
         selectedSequenceIndex = 0,
@@ -653,6 +681,36 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
   }
 
   fun play() {
+    if (eosSeekReproductionEnabled) {
+      if (eosSeekJob?.isActive == true) {
+        return
+      }
+      eosSeekJob =
+        viewModelScope.launch {
+          val player = compositionPlayer
+          player.pause()
+          repeat(5) { cycle ->
+            player.setScrubbingModeEnabled(true)
+            for (positionMs in listOf(150L, 260L)) {
+              lastRenderedTimeUs = C.TIME_UNSET
+              Log.i(TAG, "EosSeekRepro: cycle=$cycle seekMs=$positionMs")
+              player.seekTo(positionMs)
+              delay(1500)
+              Log.i(
+                TAG,
+                "EosSeekRepro: cycle=$cycle seekMs=$positionMs " +
+                  "renderedUs=$lastRenderedTimeUs state=${player.playbackState}",
+              )
+            }
+            player.setScrubbingModeEnabled(false)
+            delay(500)
+          }
+          player.setScrubbingModeEnabled(false)
+          Log.i(TAG, "EosSeekRepro: playback after repeated seeks")
+          player.play()
+        }
+      return
+    }
     compositionPlayer.play()
   }
 
@@ -848,6 +906,9 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
             val mediaItem =
               MediaItem.Builder()
                 .setUri(item.uri)
+                .apply {
+                  item.clippingConfiguration?.let { setClippingConfiguration(it) }
+                }
                 .setImageDurationMs(usToMs(item.durationUs)) // Ignored for audio/video
                 .build()
             val effectsForItem = mutableListOf<Effect>()
@@ -1026,9 +1087,32 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       if (SDK_INT < 28) {
         throw UnsupportedOperationException(API_28_REQUIRED_MESSAGE)
       }
+      val baseFactory = createFrameProcessorFactory()
       playerBuilder =
         CompositionPlayer.Builder(getApplication())
-          .setFrameProcessorFactory(createFrameProcessorFactory())
+          .setFrameProcessorFactory(
+            FrameProcessor.Factory { output, executor, listener ->
+              val processor = baseFactory.create(output, executor, listener)
+              object : FrameProcessor by processor {
+                override fun queue(frames: List<AsyncFrame>): Boolean {
+                  val accepted = processor.queue(frames)
+                  val targetUs = frames.first().frame.contentTimeUs
+                  if (accepted && eosSeekReproductionEnabled) {
+                    for (entry in frames) {
+                      val metadata = entry.frame.metadata
+                      Log.i(
+                        TAG,
+                        "EosSeekRepro: outputUs=$targetUs " +
+                          "sequence=${metadata[DefaultGlFrameProcessor.KEY_COMPOSITION_SEQUENCE_INDEX]} " +
+                          "item=${metadata[Composition.KEY_COMPOSITION_ITEM_INDEX]}",
+                      )
+                    }
+                  }
+                  return accepted
+                }
+              }
+            }
+          )
     } else {
       playerBuilder = CompositionPlayer.Builder(getApplication())
       if (uiState.value.sequenceTrackTypes.size > 1) {
@@ -1039,6 +1123,12 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
     val player = playerBuilder.build()
     player.addListener(
       object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+          if (eosSeekReproductionEnabled) {
+            Log.i(TAG, "EosSeekRepro: playbackState=$playbackState")
+          }
+        }
+
         override fun onPlayerError(error: PlaybackException) {
           _uiState.update { currentState ->
             currentState.copy(
@@ -1071,6 +1161,10 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       }
     )
     player.setVideoFrameMetadataListener { presentationTimeUs, releaseTimeNs, format, mediaFormat ->
+      if (eosSeekReproductionEnabled) {
+        lastRenderedTimeUs = presentationTimeUs
+        Log.i(TAG, "EosSeekRepro: renderedUs=$presentationTimeUs")
+      }
       val fps = synchronized(fpsLock) { frameRateCalculator.registerFrameAndGetFps() }
       if (fps != null) {
         _uiState.update { it.copy(currentFps = fps) }
