@@ -247,14 +247,14 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
             val before =
               Media(
                 durationUs = 10_000_000L,
-                title = "A: 1fps, ends at 4.950s",
-                uri = "file:///sdcard/Movies/item-boundary-10s-1fps.mp4",
+                title = "24fps overlay, ends at 4.916s",
+                uri = "file:///sdcard/Movies/timecode-10s-24fps.mp4",
                 clippingConfiguration =
                   MediaItem.ClippingConfiguration.Builder()
-                    .setEndPositionUs(4_950_000L)
+                    .setEndPositionUs(4_916_000L)
                     .build(),
               )
-            val after = Gap(durationUs = 5_050_000L)
+            val after = Gap(durationUs = 5_084_000L)
             listOf(listOf(primary), listOf(before, after), listOf(before, after), listOf(primary))
           }
           Preset.PIP -> {
@@ -1074,14 +1074,14 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
                 override fun queue(frames: List<AsyncFrame>): Boolean {
                   val accepted = processor.queue(frames)
                   val targetUs = frames.first().frame.contentTimeUs
-                  if (accepted && boundaryReproductionEnabled && targetUs in 4_400_000L..5_100_000L) {
+                  if (accepted && boundaryReproductionEnabled && targetUs in 4_800_000L..5_100_000L) {
                     for (entry in frames) {
                       val metadata = entry.frame.metadata
                       Log.i(
                         TAG,
                         "BoundaryRepro: outputUs=$targetUs " +
                           "sequence=${metadata[DefaultGlFrameProcessor.KEY_COMPOSITION_SEQUENCE_INDEX]} " +
-                          "item=${metadata[Composition.KEY_COMPOSITION_ITEM_INDEX]} boundaryUs=4950000",
+                          "item=${metadata[Composition.KEY_COMPOSITION_ITEM_INDEX]} boundaryUs=4916000",
                       )
                     }
                   }
@@ -1132,14 +1132,14 @@ class CompositionPreviewViewModel(application: Application) : AndroidViewModel(a
       }
     )
     player.setVideoFrameMetadataListener { presentationTimeUs, releaseTimeNs, format, mediaFormat ->
-      if (boundaryPausePending && presentationTimeUs >= 4_600_000L) {
+      if (boundaryPausePending && presentationTimeUs >= 4_900_000L) {
         boundaryPausePending = false
         Handler(Looper.getMainLooper()).post {
           player.pause()
           Log.i(
             TAG,
             "BoundaryRepro: paused after outputUs=$presentationTimeUs " +
-              "boundaryUs=4950000 state=${player.playbackState}",
+              "boundaryUs=4916000 state=${player.playbackState}",
           )
         }
       }
