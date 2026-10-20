@@ -72,6 +72,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.robolectric.annotation.Config;
 
 /** Unit test for {@link SequenceRenderersFactory}. */
 @RunWith(AndroidJUnit4.class)
@@ -247,6 +248,63 @@ public final class SequenceRenderersFactoryTest {
   }
 
   @Test
+  @Config(sdk = 28)
+  public void hardwareBufferVideoRenderer_resetWithoutKeyFrame_beforeInput_returnsFalse()
+      throws Exception {
+    Renderer renderer = createEnabledHardwareBufferVideoRenderer(/* includeEndOfStream= */ false);
+
+    assertThat(renderer.supportsResetPositionWithoutKeyFrameReset(/* positionUs= */ 1_000))
+        .isFalse();
+
+    renderer.disable();
+    renderer.reset();
+  }
+
+  @Test
+  @Config(sdk = 28)
+  public void hardwareBufferVideoRenderer_resetWithoutKeyFrame_beforeEos_preservesForwardReuse()
+      throws Exception {
+    Renderer renderer = createEnabledHardwareBufferVideoRenderer(/* includeEndOfStream= */ false);
+    renderer.render(/* positionUs= */ 0, /* elapsedRealtimeUs= */ 0);
+
+    assertThat(renderer.hasReadStreamToEnd()).isFalse();
+    assertThat(renderer.supportsResetPositionWithoutKeyFrameReset(/* positionUs= */ 1_000))
+        .isTrue();
+
+    renderer.disable();
+    renderer.reset();
+  }
+
+  @Test
+  @Config(sdk = 28)
+  public void hardwareBufferVideoRenderer_resetWithoutKeyFrame_beforeResetPosition_returnsFalse()
+      throws Exception {
+    Renderer renderer = createEnabledHardwareBufferVideoRenderer(/* includeEndOfStream= */ false);
+    renderer.render(/* positionUs= */ 0, /* elapsedRealtimeUs= */ 0);
+
+    assertThat(renderer.hasReadStreamToEnd()).isFalse();
+    assertThat(renderer.supportsResetPositionWithoutKeyFrameReset(/* positionUs= */ -1)).isFalse();
+
+    renderer.disable();
+    renderer.reset();
+  }
+
+  @Test
+  @Config(sdk = 28)
+  public void hardwareBufferVideoRenderer_resetWithoutKeyFrame_afterEos_returnsFalse()
+      throws Exception {
+    Renderer renderer = createEnabledHardwareBufferVideoRenderer(/* includeEndOfStream= */ true);
+    renderer.render(/* positionUs= */ 0, /* elapsedRealtimeUs= */ 0);
+
+    assertThat(renderer.hasReadStreamToEnd()).isTrue();
+    assertThat(renderer.supportsResetPositionWithoutKeyFrameReset(/* positionUs= */ 1_000))
+        .isFalse();
+
+    renderer.disable();
+    renderer.reset();
+  }
+
+  @Test
   @SuppressWarnings("deprecation") // Uses deprecated CompositionFrameMetadata.
   public void hardwareBufferImageRenderer_loopingSequence_wrapsItemIndexInFrameMetadata()
       throws Exception {
@@ -371,6 +429,53 @@ public final class SequenceRenderersFactoryTest {
   private static void enableRenderer(
       Renderer renderer, Timeline timeline, int periodIndex, Format format)
       throws ExoPlaybackException {
+    enableRenderer(
+        renderer,
+        timeline,
+        periodIndex,
+        format,
+        ImmutableList.of(
+            oneByteSample(/* timeUs= */ 0L, C.BUFFER_FLAG_KEY_FRAME), END_OF_STREAM_ITEM));
+  }
+
+  private Renderer createEnabledHardwareBufferVideoRenderer(boolean includeEndOfStream)
+      throws ExoPlaybackException {
+    EditedMediaItemSequence sequence = createSequence();
+    HardwareBufferFrameReader frameReader =
+        createHardwareBufferFrameReader(
+            sequence,
+            new ArrayList<>(),
+            handlerThread.getLooper(),
+            (width, height, format, maxImages, usage) -> new FakeImageReaderAdapter());
+    Renderer renderer =
+        createRenderer(createFactoryForHardwareBuffer(() -> frameReader), C.TRACK_TYPE_VIDEO);
+    Format format =
+        new Format.Builder()
+            .setSampleMimeType(MimeTypes.VIDEO_H264)
+            .setWidth(640)
+            .setHeight(360)
+            .build();
+    ImmutableList.Builder<FakeSampleStream.FakeSampleStreamItem> samples = ImmutableList.builder();
+    samples.add(oneByteSample(/* timeUs= */ 0L, C.BUFFER_FLAG_KEY_FRAME));
+    if (includeEndOfStream) {
+      samples.add(END_OF_STREAM_ITEM);
+    }
+    enableRenderer(
+        renderer,
+        new CompositionPlayer.CompositionForwardingTimeline(new FakeTimeline(), sequence),
+        /* periodIndex= */ 0,
+        format,
+        samples.build());
+    return renderer;
+  }
+
+  private static void enableRenderer(
+      Renderer renderer,
+      Timeline timeline,
+      int periodIndex,
+      Format format,
+      List<FakeSampleStream.FakeSampleStreamItem> samples)
+      throws ExoPlaybackException {
     FakeSampleStream fakeSampleStream =
         new FakeSampleStream(
             new DefaultAllocator(/* trimOnReset= */ true, /* individualAllocationSize= */ 1024),
@@ -378,8 +483,7 @@ public final class SequenceRenderersFactoryTest {
             DrmSessionManager.DRM_UNSUPPORTED,
             new DrmSessionEventListener.EventDispatcher(),
             format,
-            ImmutableList.of(
-                oneByteSample(/* timeUs= */ 0L, C.BUFFER_FLAG_KEY_FRAME), END_OF_STREAM_ITEM));
+            samples);
     fakeSampleStream.writeData(/* startPositionUs= */ 0);
     renderer.init(/* index= */ 0, PlayerId.UNSET, SystemClock.DEFAULT);
     renderer.setTimeline(timeline);

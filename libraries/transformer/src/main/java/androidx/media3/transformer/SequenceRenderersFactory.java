@@ -890,6 +890,12 @@ import org.jspecify.annotations.Nullable;
     }
 
     @Override
+    public boolean supportsResetPositionWithoutKeyFrameReset(long positionUs) {
+      // After EOS, flushed frame queues need the final frame decoded again.
+      return !hasReadStreamToEnd() && super.supportsResetPositionWithoutKeyFrameReset(positionUs);
+    }
+
+    @Override
     protected void onStreamChanged(
         Format[] formats,
         long startPositionUs,
